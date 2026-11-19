@@ -194,7 +194,7 @@ class StoryService : AccessibilityService() {
         var anyArea = 0L
         var anyTop = -1
 
-        for (id in TITLE_IDS) {
+        for (id in TITLE_IDS + learnedIds) {
             val nodes = root.findAccessibilityNodeInfosByViewId(id) ?: continue
             for (node in nodes) {
                 try {
@@ -225,7 +225,7 @@ class StoryService : AccessibilityService() {
             }
         }
         lastTitleTop = if (bestVisible != null) visibleTop else anyTop
-        return bestVisible ?: bestAny
+        return bestVisible ?: bestAny ?: heuristicUser(root, log)
     }
 
     /**
@@ -250,6 +250,103 @@ class StoryService : AccessibilityService() {
         return null
     }
 
+    // ---- Detección de respaldo (sin depender de IDs de Instagram) ---------------------------
+
+    private class Txt(val text: String, val id: String?, val r: Rect)
+
+    /** IDs de título aprendidos automáticamente cuando la heurística acierta. */
+    private val learnedIds: MutableSet<String> by lazy {
+        prefs.getStringSet("title_ids", emptySet())!!.toMutableSet()
+    }
+
+    private val REPLY = Regex("(send message|enviar mensaje|reply|responder|mensaje)", RegexOption.IGNORE_CASE)
+    private var lastSeenAt = 0L
+    private var lastDiagAt = 0L
+
+    private fun collectTop(n: AccessibilityNodeInfo?, depth: Int, maxTop: Int, sw: Int, out: MutableList<Txt>) {
+        if (n == null || depth > 30) return
+        val t = (n.text ?: n.contentDescription)?.toString()?.trim()
+        if (!t.isNullOrEmpty() && t.length <= 80) {
+            val r = Rect()
+            n.getBoundsInScreen(r)
+            if (r.top in 0 until maxTop && r.height() > 0 && r.right > 0 && r.left < sw) {
+                out.add(Txt(t, n.viewIdResourceName, r))
+            }
+        }
+        for (i in 0 until n.childCount) {
+            val c = n.getChild(i)
+            collectTop(c, depth + 1, maxTop, sw, out)
+            recycle(c)
+        }
+    }
+
+    private fun hasReplyBox(n: AccessibilityNodeInfo?, depth: Int, minTop: Int): Boolean {
+        if (n == null || depth > 30) return false
+        val s = (n.hintText ?: n.text ?: n.contentDescription)?.toString()
+        if (s != null && s.length < 60 && REPLY.containsMatchIn(s)) {
+            val r = Rect()
+            n.getBoundsInScreen(r)
+            if (r.top > minTop) return true
+        }
+        for (i in 0 until n.childCount) {
+            val c = n.getChild(i)
+            val hit = hasReplyBox(c, depth + 1, minTop)
+            recycle(c)
+            if (hit) return true
+        }
+        return false
+    }
+
+    /** Sin IDs: fila superior con "usuario ... 8h" + caja de respuesta abajo (visor de stories). */
+    private fun heuristicUser(root: AccessibilityNodeInfo, log: Boolean): String? {
+        val dm = resources.displayMetrics
+        val items = ArrayList<Txt>()
+        collectTop(root, 0, (dm.heightPixels * 0.22f).toInt(), dm.widthPixels, items)
+
+        if (log) items.forEach { Log.d(TAG, "top: id=${it.id} text='${it.text}' r=${it.r}") }
+
+        val tol = 24 * dm.density
+        var found: Txt? = null
+        var user: String? = null
+
+        for (a in items) {
+            if (CurrentStory.parseAge(a.text) == null) continue
+            // Caso 1: usuario y edad en el mismo nodo ("user 8h")
+            val tok = a.text.takeWhile { !it.isWhitespace() }
+            if (a.text.length > tok.length && USER.matches(tok) && CurrentStory.parseAge(tok) == null) {
+                found = a
+                user = tok
+                break
+            }
+            // Caso 2: nodos hermanos en la misma fila (usuario a la izquierda de la edad)
+            for (c in items) {
+                if (c === a) continue
+                val t = c.text.takeWhile { !it.isWhitespace() }
+                if (!USER.matches(t) || CurrentStory.parseAge(t) != null) continue
+                if (kotlin.math.abs(c.r.centerY() - a.r.centerY()) > tol) continue
+                if (c.r.left > a.r.left) continue
+                found = c
+                user = t
+                break
+            }
+            if (user != null) break
+        }
+        if (user == null) return null
+
+        // Evita falsos positivos (feed, perfil): el visor tiene caja de respuesta abajo.
+        if (!hasReplyBox(root, 0, (dm.heightPixels * 0.6f).toInt())) return null
+
+        // Auto-aprendizaje: si el nodo del usuario tiene ID, la próxima vez va por la vía rápida.
+        val id = found?.id
+        if (id != null && id !in learnedIds && id !in TITLE_IDS) {
+            learnedIds.add(id)
+            prefs.edit().putStringSet("title_ids", learnedIds.toSet()).apply()
+            Log.w(TAG, "ID de título aprendido: $id")
+        }
+        lastTitleTop = found?.r?.top ?: -1
+        return user
+    }
+
     private fun check() {
         if (busy) return
         val root = rootInActiveWindow ?: return
@@ -266,9 +363,24 @@ class StoryService : AccessibilityService() {
                 dump(root, 0)
             }
 
+            val now = System.currentTimeMillis()
+            if (user != null) {
+                lastSeenAt = now
+            } else if (now - lastDiagAt > 8000) {
+                // Diagnóstico permanente: si falla, el log muestra qué ve el servicio arriba.
+                lastDiagAt = now
+                val dm = resources.displayMetrics
+                val tmp = ArrayList<Txt>()
+                collectTop(root, 0, (dm.heightPixels * 0.22f).toInt(), dm.widthPixels, tmp)
+                Log.d(TAG, "sin usuario; nodos arriba=${tmp.size}")
+                tmp.forEach { Log.d(TAG, "top: id=${it.id} text='${it.text}' r=${it.r}") }
+            }
+            // Histéresis: un fallo puntual de detección no oculta el botón al instante.
+            val keep = shown && now - lastSeenAt < 1500
+
             if (!busy) {
-                username = user
-                setShown(user != null)
+                username = user ?: if (keep) username else null
+                setShown(user != null || keep)
                 maybePrefetch(user)
             }
         } finally {
